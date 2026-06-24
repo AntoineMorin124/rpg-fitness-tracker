@@ -14,16 +14,35 @@ import {
 /* Constants                                                          */
 /* ------------------------------------------------------------------ */
 
-const STORAGE_KEY = "rpg-fitness-tracker-v1";
+const STORAGE_KEY = "rpg-fitness-tracker-v2";
 const ACCENT_PURPLE = "#7C3AED";
 const ACCENT_GOLD = "#F59E0B";
 const BG = "#0D0F1A";
 
-const XP_PER_WEIGHT_LOG = 10;
-const XP_PER_LIFT_LOG = 15;
+const XP_PER_SET_LOG = 12;
 const XP_PER_LEVEL = 250;
 
-const KG_TO_LB = 2.20462;
+const VALID_USERNAME = "warrior";
+const VALID_PASSWORD = "ironquest";
+
+const EXERCISE_LIST = [
+  "Squat",
+  "Bench Press",
+  "Deadlift",
+  "Pull Up",
+  "Chin Up",
+  "Lat Pulldown",
+  "Dumbbell Rows",
+  "Bicep Curl",
+  "Hammer Curl",
+  "Lunges",
+  "Quad Extension",
+  "Hamstring Curl",
+  "Plank",
+  "Chair Hold",
+];
+
+const TIME_BASED_EXERCISES = new Set(["Plank", "Chair Hold"]);
 
 const ACHIEVEMENT_DEFS = [
   {
@@ -47,7 +66,7 @@ const ACHIEVEMENT_DEFS = [
   {
     id: "fifty_entries",
     name: "Veteran Warrior",
-    desc: "Log 50 total entries.",
+    desc: "Log 50 total sets.",
     check: (s) => s.totalEntries >= 50,
   },
   {
@@ -98,7 +117,6 @@ function startOfWeek(iso) {
 }
 
 function linearRegression(points) {
-  // points: [{x: number, y: number}]
   const n = points.length;
   if (n === 0) return { slope: 0, intercept: 0 };
   if (n === 1) return { slope: 0, intercept: points[0].y };
@@ -119,37 +137,16 @@ function linearRegression(points) {
   return { slope, intercept };
 }
 
-function rollingAverage(sortedEntries, windowDays = 7) {
-  // sortedEntries: [{date, weight}] sorted ascending by date, may have multiple per day
-  // returns map date(iso, day-level) -> avg of all entries within trailing windowDays (inclusive)
-  const byDay = {};
-  sortedEntries.forEach((e) => {
-    if (!byDay[e.date]) byDay[e.date] = [];
-    byDay[e.date].push(e.weight);
-  });
-  const days = Object.keys(byDay).sort();
-  const dayAvg = days.map((d) => ({
-    date: d,
-    avg: byDay[d].reduce((a, b) => a + b, 0) / byDay[d].length,
-  }));
-  const msDay = 86400000;
-  return dayAvg.map((d, i) => {
-    const cutoff = new Date(d.date + "T00:00:00").getTime() - (windowDays - 1) * msDay;
-    const within = dayAvg.filter(
-      (x) => new Date(x.date + "T00:00:00").getTime() >= cutoff && x.date <= d.date
-    );
-    const avg = within.reduce((a, x) => a + x.avg, 0) / within.length;
-    return { date: d.date, rollingAvg: avg };
-  });
-}
-
 function epley1RM(weight, reps) {
   if (reps <= 1) return weight;
   return weight * (1 + reps / 30);
 }
 
-function toKg(weight, unit) {
-  return unit === "lbs" ? weight / KG_TO_LB : weight;
+function lerpColor(hex1, hex2, t) {
+  const c1 = hex1.match(/\w\w/g).map((x) => parseInt(x, 16));
+  const c2 = hex2.match(/\w\w/g).map((x) => parseInt(x, 16));
+  const c = c1.map((v, i) => Math.round(v + (c2[i] - v) * t));
+  return `#${c.map((v) => v.toString(16).padStart(2, "0")).join("")}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -161,10 +158,9 @@ function generateSeedData() {
   const baseWeight = 84.5;
   for (let i = 21; i >= 0; i--) {
     const date = daysAgoISO(i);
-    // skip some days entirely, double-log others
     const roll = Math.random();
-    if (roll < 0.18) continue; // no entry that day
-    const trend = -0.04 * (21 - i); // slowly losing weight
+    if (roll < 0.18) continue;
+    const trend = -0.04 * (21 - i);
     const noise = (Math.random() - 0.5) * 1.1;
     const w1 = +(baseWeight + trend + noise).toFixed(1);
     weightEntries.push({ id: uid(), date, weight: w1 });
@@ -175,26 +171,47 @@ function generateSeedData() {
   }
 
   const liftDefs = [
-    { name: "Bench Press", unit: "kg", start: 60, growth: 1.1 },
-    { name: "Back Squat", unit: "kg", start: 80, growth: 1.6 },
-    { name: "Deadlift", unit: "kg", start: 100, growth: 1.8 },
+    { name: "Bench Press", start: 60, growth: 1.1 },
+    { name: "Squat", start: 80, growth: 1.6 },
+    { name: "Deadlift", start: 100, growth: 1.8 },
   ];
+  const progress = {};
+  liftDefs.forEach((d) => (progress[d.name] = d.start));
 
-  const lifts = liftDefs.map((def) => {
-    const entries = [];
-    let weight = def.start;
-    for (let i = 19; i >= 0; i -= 3) {
-      const date = daysAgoISO(i);
-      if (Math.random() < 0.15) continue;
-      weight = +(weight + def.growth + (Math.random() - 0.4) * 1.2).toFixed(1);
-      const reps = [5, 6, 8, 10][Math.floor(Math.random() * 4)];
-      const sets = [3, 4, 5][Math.floor(Math.random() * 3)];
-      entries.push({ id: uid(), date, weight, reps, sets });
+  const workouts = [];
+  for (let i = 19; i >= 0; i -= 3) {
+    const date = daysAgoISO(i);
+    if (Math.random() < 0.1) continue;
+    const exercises = liftDefs
+      .filter(() => Math.random() > 0.15)
+      .map((def) => {
+        progress[def.name] = +(
+          progress[def.name] +
+          def.growth +
+          (Math.random() - 0.4) * 1.2
+        ).toFixed(1);
+        const reps = [5, 6, 8, 10][Math.floor(Math.random() * 4)];
+        const setCount = [3, 4][Math.floor(Math.random() * 2)];
+        const sets = Array.from({ length: setCount }, () => ({
+          id: uid(),
+          reps,
+          weight: progress[def.name],
+        }));
+        return { id: uid(), name: def.name, sets };
+      });
+    if (Math.random() > 0.5) {
+      exercises.push({
+        id: uid(),
+        name: "Plank",
+        sets: [{ id: uid(), durationSec: 30 + Math.round(Math.random() * 60) }],
+      });
     }
-    return { id: uid(), name: def.name, unit: def.unit, entries };
-  });
+    if (exercises.length) {
+      workouts.push({ id: uid(), date, exercises });
+    }
+  }
 
-  return { weightEntries, lifts };
+  return { weightEntries, workouts };
 }
 
 /* ------------------------------------------------------------------ */
@@ -224,51 +241,64 @@ function saveState(state) {
 /* Derived stats                                                      */
 /* ------------------------------------------------------------------ */
 
-function computeLiftStats(lift) {
-  const sorted = [...lift.entries].sort((a, b) => a.date.localeCompare(b.date));
-  let best1RM = 0;
-  let bestEntryId = null;
-  let prIds = new Set();
-  let runningBest = 0;
-  sorted.forEach((e) => {
-    const oneRM = epley1RM(e.weight, e.reps);
-    if (oneRM >= runningBest) {
-      runningBest = oneRM;
-      prIds.add(e.id);
-    }
-    if (oneRM > best1RM) {
-      best1RM = oneRM;
-      bestEntryId = e.id;
-    }
+function flattenExerciseSets(workouts, exerciseName) {
+  const out = [];
+  workouts.forEach((w) => {
+    w.exercises
+      .filter((ex) => ex.name === exerciseName)
+      .forEach((ex) => {
+        ex.sets.forEach((s) => out.push({ ...s, date: w.date }));
+      });
   });
-  const powerLevel = Math.round(best1RM);
-  return { sorted, best1RM, bestEntryId, prIds, powerLevel };
+  return out.sort((a, b) => a.date.localeCompare(b.date));
 }
 
-function computeWarriorStats(weightEntries, lifts) {
-  const totalWeightLogs = weightEntries.length;
-  const totalLiftLogs = lifts.reduce((s, l) => s + l.entries.length, 0);
-  const totalEntries = totalWeightLogs + totalLiftLogs;
-  const totalXP = totalWeightLogs * XP_PER_WEIGHT_LOG + totalLiftLogs * XP_PER_LIFT_LOG;
+function computeExerciseStats(name, sorted) {
+  const isTimeBased = TIME_BASED_EXERCISES.has(name);
+  let best = 0;
+  let bestId = null;
+  const prIds = new Set();
+  let runningBest = 0;
+  sorted.forEach((e) => {
+    const metric = isTimeBased ? e.durationSec : epley1RM(e.weight, e.reps);
+    if (metric >= runningBest) {
+      runningBest = metric;
+      prIds.add(e.id);
+    }
+    if (metric > best) {
+      best = metric;
+      bestId = e.id;
+    }
+  });
+  const powerLevel = Math.round(best);
+  return { sorted, best, bestId, prIds, powerLevel, isTimeBased };
+}
+
+function computeWarriorStats(weightEntries, workouts) {
+  const allSets = [];
+  workouts.forEach((w) =>
+    w.exercises.forEach((ex) =>
+      ex.sets.forEach((s) => allSets.push({ ...s, date: w.date, name: ex.name }))
+    )
+  );
+  const totalEntries = allSets.length;
+  const totalXP = totalEntries * XP_PER_SET_LOG;
   const level = Math.floor(totalXP / XP_PER_LEVEL) + 1;
   const xpIntoLevel = totalXP % XP_PER_LEVEL;
   const xpForNext = XP_PER_LEVEL;
 
-  // streak: consecutive days (ending at most recent log date) with >=1 entry
   const allDates = new Set([
     ...weightEntries.map((e) => e.date),
-    ...lifts.flatMap((l) => l.entries.map((e) => e.date)),
+    ...workouts.map((w) => w.date),
   ]);
   let streak = 0;
   if (allDates.size > 0) {
     const todayISO = toISODate(new Date());
     let cursor = allDates.has(todayISO) ? todayISO : null;
     if (!cursor) {
-      // start from most recent logged day if today has no entry yet
       const sortedDates = [...allDates].sort().reverse();
       const mostRecent = sortedDates[0];
-      const diffDays =
-        (new Date(todayISO) - new Date(mostRecent)) / 86400000;
+      const diffDays = (new Date(todayISO) - new Date(mostRecent)) / 86400000;
       if (diffDays <= 1) cursor = mostRecent;
     }
     if (cursor) {
@@ -280,34 +310,34 @@ function computeWarriorStats(weightEntries, lifts) {
     }
   }
 
-  // consistency: % of last 30 days with activity
   let activeDaysLast30 = 0;
   for (let i = 0; i < 30; i++) {
     if (allDates.has(daysAgoISO(i))) activeDaysLast30++;
   }
   const consistencyPct = Math.round((activeDaysLast30 / 30) * 100);
 
-  const liftStatsList = lifts.map((l) => ({ lift: l, ...computeLiftStats(l) }));
+  const exercisesWithData = EXERCISE_LIST.filter((name) =>
+    allSets.some((s) => s.name === name)
+  );
+  const liftStatsList = exercisesWithData.map((name) => {
+    const sorted = flattenExerciseSets(workouts, name);
+    return { name, ...computeExerciseStats(name, sorted) };
+  });
+
   const totalPRs = liftStatsList.reduce((s, l) => s + l.prIds.size, 0);
   const maxSingleLiftKg = Math.max(
     0,
-    ...lifts.flatMap((l) => l.entries.map((e) => toKg(e.weight, l.unit)))
+    ...allSets.filter((s) => !TIME_BASED_EXERCISES.has(s.name)).map((s) => s.weight || 0)
   );
-  const strScore = liftStatsList.length
-    ? Math.round(
-        liftStatsList.reduce((s, l) => s + l.best1RM, 0) / liftStatsList.length
-      )
+  const strengthLifts = liftStatsList.filter((l) => !l.isTimeBased);
+  const strScore = strengthLifts.length
+    ? Math.round(strengthLifts.reduce((s, l) => s + l.best, 0) / strengthLifts.length)
     : 0;
   const pwrScore = liftStatsList.reduce((s, l) => s + l.powerLevel, 0);
 
-  // this week XP
   const thisWeekStart = startOfWeek(toISODate(new Date()));
   const weeklyXP =
-    weightEntries.filter((e) => e.date >= thisWeekStart).length * XP_PER_WEIGHT_LOG +
-    lifts
-      .flatMap((l) => l.entries)
-      .filter((e) => e.date >= thisWeekStart).length *
-      XP_PER_LIFT_LOG;
+    allSets.filter((s) => s.date >= thisWeekStart).length * XP_PER_SET_LOG;
 
   return {
     totalEntries,
@@ -340,6 +370,12 @@ function weightTrend(weightEntries) {
   if (slopePerWeek > 0.15) direction = "gaining";
   else if (slopePerWeek < -0.15) direction = "losing";
   return { direction, slopePerWeek, slope, intercept, t0, sorted };
+}
+
+function latestWeight(weightEntries) {
+  if (!weightEntries.length) return null;
+  const sorted = [...weightEntries].sort((a, b) => a.date.localeCompare(b.date));
+  return sorted[sorted.length - 1].weight;
 }
 
 /* ------------------------------------------------------------------ */
@@ -425,9 +461,7 @@ function PRToast({ event, onDone }) {
           NEW PERSONAL RECORD
         </div>
         <div className="text-white text-lg">{event.liftName}</div>
-        <div className="text-purple-300 text-sm font-mono">
-          1RM: {event.oneRM.toFixed(1)} kg
-        </div>
+        <div className="text-purple-300 text-sm font-mono">{event.detail}</div>
       </div>
     </div>
   );
@@ -458,404 +492,447 @@ function LevelUpFlash({ show, level, onDone }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Weight Tab                                                          */
+/* Login Screen                                                       */
 /* ------------------------------------------------------------------ */
 
-function WeightTab({ weightEntries, addWeightEntry }) {
-  const [date, setDate] = useState(toISODate(new Date()));
-  const [weight, setWeight] = useState("");
+function LoginScreen({ onLogin }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(false);
+  const [shake, setShake] = useState(false);
 
-  const sorted = useMemo(
-    () => [...weightEntries].sort((a, b) => a.date.localeCompare(b.date)),
-    [weightEntries]
-  );
-  const trend = useMemo(() => weightTrend(weightEntries), [weightEntries]);
-  const rolling = useMemo(() => rollingAverage(sorted), [sorted]);
-
-  const chartData = useMemo(() => {
-    const rollMap = {};
-    rolling.forEach((r) => (rollMap[r.date] = r.rollingAvg));
-    const days = [...new Set(sorted.map((e) => e.date))].sort();
-    return days.map((d) => {
-      const dayEntries = sorted.filter((e) => e.date === d);
-      const avg = dayEntries.reduce((a, e) => a + e.weight, 0) / dayEntries.length;
-      const dayIndex =
-        (new Date(d + "T00:00:00").getTime() - (trend.t0 || 0)) / 86400000;
-      const trendVal =
-        trend.slope !== undefined ? trend.slope * dayIndex + trend.intercept : null;
-      return {
-        date: d,
-        label: fmtDate(d),
-        weight: +avg.toFixed(2),
-        rollingAvg: rollMap[d] ? +rollMap[d].toFixed(2) : null,
-        trendLine: trendVal !== null ? +trendVal.toFixed(2) : null,
-      };
-    });
-  }, [sorted, rolling, trend]);
-
-  const grouped = useMemo(() => {
-    const map = {};
-    sorted.forEach((e) => {
-      const wk = startOfWeek(e.date);
-      if (!map[wk]) map[wk] = [];
-      map[wk].push(e);
-    });
-    return Object.entries(map).sort((a, b) => b[0].localeCompare(a[0]));
-  }, [sorted]);
-
-  const directionColor =
-    trend.direction === "losing"
-      ? "text-emerald-400"
-      : trend.direction === "gaining"
-      ? "text-rose-400"
-      : "text-amber-400";
+  const submit = () => {
+    if (
+      username.trim().toLowerCase() === VALID_USERNAME &&
+      password === VALID_PASSWORD
+    ) {
+      setError(false);
+      onLogin(username.trim());
+    } else {
+      setError(true);
+      setShake(true);
+      setTimeout(() => setShake(false), 500);
+    }
+  };
 
   return (
-    <div className="space-y-6">
-      <GlowCard>
-        <h3 className="font-display text-lg text-purple-300 mb-3">Log Weigh-In</h3>
-        <div className="flex flex-wrap gap-3 items-end">
-          <div>
-            <label className="block text-xs font-mono text-gray-400 mb-1">Date</label>
-            <input
-              type="date"
-              value={date}
-              max={toISODate(new Date())}
-              onChange={(e) => setDate(e.target.value)}
-              className="bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-mono text-gray-400 mb-1">
-              Weight (kg)
-            </label>
-            <input
-              type="number"
-              step="0.1"
-              value={weight}
-              onChange={(e) => setWeight(e.target.value)}
-              placeholder="84.5"
-              className="bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono w-28"
-            />
-          </div>
-          <button
-            onClick={() => {
-              const w = parseFloat(weight);
-              if (!w || !date) return;
-              addWeightEntry(date, w);
-              setWeight("");
-            }}
-            className="bg-purple-600 hover:bg-purple-500 transition rounded px-4 py-2 text-sm font-display text-white shadow-[0_0_12px_rgba(124,58,237,0.6)]"
-          >
-            + Log Weight
-          </button>
+    <div
+      className="min-h-screen w-full flex items-center justify-center"
+      style={{ background: BG, color: "#e5e7eb" }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=JetBrains+Mono:wght@400;600&display=swap');
+        .font-display { font-family: 'Press Start 2P', 'JetBrains Mono', monospace; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        @keyframes shake {
+          0%, 100% { transform: translateX(0); }
+          20% { transform: translateX(-10px); }
+          40% { transform: translateX(10px); }
+          60% { transform: translateX(-6px); }
+          80% { transform: translateX(6px); }
+        }
+        @keyframes flicker {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.85; }
+        }
+      `}</style>
+      <div
+        className={`w-full max-w-sm rounded-xl border-2 p-8 ${shake ? "animate-[shake_0.5s_ease-in-out]" : ""}`}
+        style={{
+          borderColor: ACCENT_PURPLE,
+          background: "radial-gradient(circle at 50% 0%, rgba(124,58,237,0.15), rgba(13,15,26,0.95))",
+          boxShadow: `0 0 40px rgba(124,58,237,0.35)`,
+        }}
+      >
+        <h1
+          className="font-display text-2xl text-center mb-1 tracking-wider"
+          style={{ color: ACCENT_GOLD, textShadow: `0 0 16px ${ACCENT_GOLD}`, animation: "flicker 3s infinite" }}
+        >
+          ⚔ IRON QUEST
+        </h1>
+        <div className="text-center font-mono text-xs text-purple-300 tracking-[0.2em] mb-6">
+          ENTER THE ARENA
         </div>
-      </GlowCard>
 
-      <GlowCard>
-        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-          <h3 className="font-display text-lg text-purple-300">Weight Over Time</h3>
-          <div className={`font-mono text-sm ${directionColor}`}>
-            Trend: {trend.direction} ({trend.slopePerWeek >= 0 ? "+" : ""}
-            {trend.slopePerWeek.toFixed(2)} kg/wk)
-          </div>
-        </div>
-        <div style={{ width: "100%", height: 300 }}>
-          <ResponsiveContainer>
-            <LineChart data={chartData}>
-              <CartesianGrid stroke="#ffffff15" strokeDasharray="3 3" />
-              <XAxis dataKey="label" stroke="#9ca3af" fontSize={11} />
-              <YAxis stroke="#9ca3af" fontSize={11} domain={["auto", "auto"]} />
-              <Tooltip
-                contentStyle={{
-                  background: "#13152499",
-                  border: "1px solid #7C3AED55",
-                  fontSize: 12,
-                }}
-              />
-              <Legend wrapperStyle={{ fontSize: 11 }} />
-              <Line
-                type="monotone"
-                dataKey="weight"
-                name="Daily avg"
-                stroke="#6b7280"
-                strokeWidth={1.5}
-                dot={{ r: 2 }}
-              />
-              <Line
-                type="monotone"
-                dataKey="rollingAvg"
-                name="7-day avg"
-                stroke={ACCENT_PURPLE}
-                strokeWidth={2.5}
-                dot={false}
-              />
-              <Line
-                type="linear"
-                dataKey="trendLine"
-                name="Trend"
-                stroke={ACCENT_GOLD}
-                strokeWidth={2}
-                strokeDasharray="6 4"
-                dot={false}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      </GlowCard>
+        <label className="block text-xs font-mono text-gray-400 mb-1">Username</label>
+        <input
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder="Your warrior name"
+          className="w-full bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono mb-4 focus:border-amber-400 outline-none"
+        />
 
-      <GlowCard>
-        <h3 className="font-display text-lg text-purple-300 mb-3">Entries by Week</h3>
-        <div className="space-y-4 max-h-96 overflow-y-auto pr-1">
-          {grouped.map(([wk, entries]) => (
-            <div key={wk}>
-              <div className="text-xs font-mono text-amber-400 mb-1">
-                Week of {fmtDate(wk)}
-              </div>
-              <div className="space-y-1">
-                {entries
-                  .sort((a, b) => b.date.localeCompare(a.date))
-                  .map((e) => (
-                    <div
-                      key={e.id}
-                      className="flex justify-between text-sm font-mono text-gray-300 border-b border-white/5 py-1"
-                    >
-                      <span>{fmtDate(e.date)}</span>
-                      <span className="text-white">{e.weight.toFixed(1)} kg</span>
-                    </div>
-                  ))}
-              </div>
-            </div>
-          ))}
-          {grouped.length === 0 && (
-            <div className="text-gray-500 text-sm font-mono">No entries yet.</div>
-          )}
+        <label className="block text-xs font-mono text-gray-400 mb-1">Password</label>
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder="••••••••"
+          className="w-full bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono mb-4 focus:border-amber-400 outline-none"
+        />
+
+        {error && (
+          <div className="text-center font-display text-xs text-rose-400 mb-4 tracking-widest">
+            ⛔ ACCESS DENIED
+          </div>
+        )}
+
+        <button
+          onClick={submit}
+          className="w-full bg-purple-600 hover:bg-purple-500 transition rounded px-4 py-3 text-sm font-display text-white shadow-[0_0_16px_rgba(124,58,237,0.6)]"
+        >
+          ENTER
+        </button>
+
+        <div className="text-center font-mono text-[10px] text-gray-500 mt-4">
+          hint: warrior / ironquest
         </div>
-      </GlowCard>
+      </div>
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* Lift Tab                                                            */
+/* Exercise Picker Grid                                               */
 /* ------------------------------------------------------------------ */
 
-function LiftTab({ lifts, addLift, addLiftEntry }) {
-  const [selectedId, setSelectedId] = useState(lifts[0]?.id || null);
-  const [newLiftName, setNewLiftName] = useState("");
-  const [date, setDate] = useState(toISODate(new Date()));
-  const [sets, setSets] = useState("");
+function ExercisePicker({ onSelect, onClose, excludeNames = [] }) {
+  return (
+    <div className="mt-3 rounded-lg border border-amber-400/40 bg-black/30 p-3">
+      <div className="flex items-center justify-between mb-2">
+        <span className="font-display text-xs text-amber-400">Choose Exercise</span>
+        <button
+          onClick={onClose}
+          className="text-xs font-mono text-gray-400 hover:text-white"
+        >
+          ✕ close
+        </button>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+        {EXERCISE_LIST.map((name) => {
+          const disabled = excludeNames.includes(name);
+          return (
+            <button
+              key={name}
+              disabled={disabled}
+              onClick={() => onSelect(name)}
+              className={`px-2 py-2 rounded-lg border font-mono text-xs transition ${
+                disabled
+                  ? "border-white/5 text-gray-600 cursor-not-allowed"
+                  : "border-white/15 text-gray-200 hover:border-purple-400/70 hover:bg-purple-400/10"
+              }`}
+            >
+              {TIME_BASED_EXERCISES.has(name) ? "⏱ " : "🏋 "}
+              {name}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Workouts Tab                                                       */
+/* ------------------------------------------------------------------ */
+
+function ExerciseBlock({ exercise, onAddSet }) {
+  const isTimeBased = TIME_BASED_EXERCISES.has(exercise.name);
   const [reps, setReps] = useState("");
   const [weight, setWeight] = useState("");
+  const [duration, setDuration] = useState("");
+  const stats = computeExerciseStats(
+    exercise.name,
+    exercise.sets.map((s) => ({ ...s, date: "" }))
+  );
+
+  return (
+    <div className="rounded-lg border border-white/10 bg-black/20 p-3 mb-3">
+      <div className="flex items-center justify-between mb-2">
+        <span className="font-display text-sm text-white">
+          {TIME_BASED_EXERCISES.has(exercise.name) ? "⏱" : "🏋"} {exercise.name}
+        </span>
+        <span className="font-mono text-xs text-purple-400">
+          {exercise.sets.length} set{exercise.sets.length === 1 ? "" : "s"} logged
+        </span>
+      </div>
+
+      <div className="space-y-1 mb-2">
+        {exercise.sets.map((s) => (
+          <div
+            key={s.id}
+            className="flex justify-between text-xs font-mono text-gray-300 border-b border-white/5 py-1"
+          >
+            {isTimeBased ? (
+              <span>Hold: {s.durationSec}s</span>
+            ) : (
+              <span>
+                {s.reps} reps @ {s.weight}kg
+              </span>
+            )}
+            {s.id === stats.bestId && (
+              <span className="text-amber-400 px-1.5 py-0.5 rounded border border-amber-400/60 bg-amber-400/10">
+                PR
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {isTimeBased ? (
+        <div className="flex gap-2 items-end">
+          <input
+            type="number"
+            value={duration}
+            onChange={(e) => setDuration(e.target.value)}
+            placeholder="Seconds"
+            className="bg-black/40 border border-white/20 rounded px-2 py-1.5 text-xs text-white font-mono w-24"
+          />
+          <button
+            onClick={() => {
+              const d = parseInt(duration);
+              if (!d) return;
+              onAddSet(exercise.id, { durationSec: d });
+              setDuration("");
+            }}
+            className="bg-amber-500 hover:bg-amber-400 transition rounded px-3 py-1.5 text-xs font-display text-black"
+          >
+            + Add Hold
+          </button>
+        </div>
+      ) : (
+        <div className="flex gap-2 items-end">
+          <input
+            type="number"
+            value={reps}
+            onChange={(e) => setReps(e.target.value)}
+            placeholder="Reps"
+            className="bg-black/40 border border-white/20 rounded px-2 py-1.5 text-xs text-white font-mono w-20"
+          />
+          <input
+            type="number"
+            step="0.5"
+            value={weight}
+            onChange={(e) => setWeight(e.target.value)}
+            placeholder="Weight (kg)"
+            className="bg-black/40 border border-white/20 rounded px-2 py-1.5 text-xs text-white font-mono w-28"
+          />
+          <button
+            onClick={() => {
+              const r = parseInt(reps);
+              const w = parseFloat(weight);
+              if (!r || !w) return;
+              onAddSet(exercise.id, { reps: r, weight: w });
+              setReps("");
+              setWeight("");
+            }}
+            className="bg-amber-500 hover:bg-amber-400 transition rounded px-3 py-1.5 text-xs font-display text-black"
+          >
+            + Add Set
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WorkoutCard({ workout, isActive, onExpand, onAddExercise, onAddSet, onFinish }) {
+  const [showPicker, setShowPicker] = useState(false);
+  const totalSets = workout.exercises.reduce((s, e) => s + e.sets.length, 0);
+
+  if (!isActive) {
+    return (
+      <button
+        onClick={onExpand}
+        className="w-full text-left rounded-lg border border-white/10 bg-black/20 p-3 hover:border-purple-400/50 transition"
+      >
+        <div className="flex justify-between items-center">
+          <span className="font-mono text-sm text-white">{fmtDate(workout.date)}</span>
+          <span className="font-mono text-xs text-gray-400">
+            {workout.exercises.length} exercise{workout.exercises.length === 1 ? "" : "s"} ·{" "}
+            {totalSets} set{totalSets === 1 ? "" : "s"}
+          </span>
+        </div>
+      </button>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border-2 border-amber-400/50 bg-black/30 p-4">
+      <div className="flex justify-between items-center mb-3">
+        <span className="font-display text-sm text-amber-300">
+          {fmtDate(workout.date)} — Active Session
+        </span>
+        <button
+          onClick={onFinish}
+          className="font-mono text-xs px-2 py-1 rounded border border-white/20 text-gray-300 hover:border-emerald-400"
+        >
+          Finish Workout
+        </button>
+      </div>
+
+      {workout.exercises.map((ex) => (
+        <ExerciseBlock key={ex.id} exercise={ex} onAddSet={onAddSet} />
+      ))}
+
+      {showPicker ? (
+        <ExercisePicker
+          excludeNames={workout.exercises.map((e) => e.name)}
+          onSelect={(name) => {
+            onAddExercise(name);
+            setShowPicker(false);
+          }}
+          onClose={() => setShowPicker(false)}
+        />
+      ) : (
+        <button
+          onClick={() => setShowPicker(true)}
+          className="w-full bg-purple-600 hover:bg-purple-500 transition rounded px-4 py-2 text-sm font-display text-white"
+        >
+          + Add Exercise
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ExerciseRecords({ workouts }) {
+  const available = EXERCISE_LIST.filter(
+    (name) => flattenExerciseSets(workouts, name).length > 0
+  );
+  const [selected, setSelected] = useState(available[0] || null);
 
   useEffect(() => {
-    if (!selectedId && lifts.length) setSelectedId(lifts[0].id);
-  }, [lifts, selectedId]);
+    if (!selected && available.length) setSelected(available[0]);
+  }, [available, selected]);
 
-  const lift = lifts.find((l) => l.id === selectedId);
-  const stats = lift ? computeLiftStats(lift) : null;
+  if (!available.length) {
+    return (
+      <div className="text-gray-500 text-sm font-mono">
+        No exercises logged yet — start a workout above.
+      </div>
+    );
+  }
 
-  const chartData = useMemo(() => {
-    if (!stats) return [];
-    return stats.sorted.map((e) => ({
-      label: fmtDate(e.date),
-      oneRM: +epley1RM(e.weight, e.reps).toFixed(1),
-      weight: e.weight,
-    }));
-  }, [stats]);
+  const sorted = flattenExerciseSets(workouts, selected);
+  const stats = computeExerciseStats(selected, sorted);
+  const isTimeBased = TIME_BASED_EXERCISES.has(selected);
 
-  const toggleUnit = (lift) => {
-    addLiftEntry(lift.id, null, null, null, null, lift.unit === "kg" ? "lbs" : "kg");
-  };
+  const chartData = sorted.map((e) => ({
+    label: fmtDate(e.date),
+    value: isTimeBased ? e.durationSec : +epley1RM(e.weight, e.reps).toFixed(1),
+  }));
+
+  return (
+    <div>
+      <div className="flex flex-wrap gap-2 mb-4">
+        {available.map((name) => {
+          const s = computeExerciseStats(name, flattenExerciseSets(workouts, name));
+          return (
+            <button
+              key={name}
+              onClick={() => setSelected(name)}
+              className={`px-3 py-2 rounded-lg border font-mono text-sm transition ${
+                selected === name
+                  ? "border-amber-400 bg-amber-400/10 text-amber-300"
+                  : "border-white/15 text-gray-300 hover:border-purple-400/60"
+              }`}
+            >
+              {name} <span className="text-purple-400">PWR {s.powerLevel}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h4 className="font-display text-sm text-purple-300">{selected} Progress</h4>
+        <div className="font-mono text-sm text-amber-400">
+          {isTimeBased ? `Best Hold: ${stats.best.toFixed(0)}s` : `Est. 1RM: ${stats.best.toFixed(1)} kg`}
+        </div>
+      </div>
+      <div style={{ width: "100%", height: 220 }}>
+        <ResponsiveContainer>
+          <LineChart data={chartData}>
+            <CartesianGrid stroke="#ffffff15" strokeDasharray="3 3" />
+            <XAxis dataKey="label" stroke="#9ca3af" fontSize={11} />
+            <YAxis stroke="#9ca3af" fontSize={11} domain={["auto", "auto"]} />
+            <Tooltip
+              contentStyle={{ background: "#13152499", border: "1px solid #7C3AED55", fontSize: 12 }}
+            />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            <Line
+              type="monotone"
+              dataKey="value"
+              name={isTimeBased ? "Hold (s)" : "Est. 1RM"}
+              stroke={ACCENT_GOLD}
+              strokeWidth={2.5}
+              dot={{ r: 3 }}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="mt-3 space-y-1 max-h-56 overflow-y-auto pr-1">
+        {[...sorted].reverse().map((e) => (
+          <div
+            key={e.id}
+            className="flex justify-between items-center text-sm font-mono text-gray-300 border-b border-white/5 py-1"
+          >
+            <span>{fmtDate(e.date)}</span>
+            <span>{isTimeBased ? `${e.durationSec}s hold` : `${e.reps} reps @ ${e.weight}kg`}</span>
+            {e.id === stats.bestId && (
+              <span className="text-amber-400 font-display text-xs px-2 py-0.5 rounded border border-amber-400/60 bg-amber-400/10">
+                PR
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WorkoutsTab({ workouts, activeWorkoutId, startWorkout, setActiveWorkoutId, addExercise, addSet }) {
+  const sortedWorkouts = [...workouts].sort((a, b) => b.date.localeCompare(a.date));
 
   return (
     <div className="space-y-6">
       <GlowCard>
-        <h3 className="font-display text-lg text-purple-300 mb-3">Exercises</h3>
-        <div className="flex flex-wrap gap-2 mb-4">
-          {lifts.map((l) => {
-            const s = computeLiftStats(l);
-            return (
-              <button
-                key={l.id}
-                onClick={() => setSelectedId(l.id)}
-                className={`px-3 py-2 rounded-lg border font-mono text-sm transition ${
-                  selectedId === l.id
-                    ? "border-amber-400 bg-amber-400/10 text-amber-300"
-                    : "border-white/15 text-gray-300 hover:border-purple-400/60"
-                }`}
-              >
-                {l.name}{" "}
-                <span className="text-purple-400">PWR {s.powerLevel}</span>
-              </button>
-            );
-          })}
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <h3 className="font-display text-lg text-purple-300">Workout Sessions</h3>
+          {!activeWorkoutId && (
+            <button
+              onClick={startWorkout}
+              className="bg-purple-600 hover:bg-purple-500 transition rounded px-4 py-2 text-sm font-display text-white shadow-[0_0_12px_rgba(124,58,237,0.6)]"
+            >
+              + Start New Workout
+            </button>
+          )}
         </div>
-        <div className="flex gap-2">
-          <input
-            value={newLiftName}
-            onChange={(e) => setNewLiftName(e.target.value)}
-            placeholder="New exercise name"
-            className="bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono flex-1"
-          />
-          <button
-            onClick={() => {
-              if (!newLiftName.trim()) return;
-              addLift(newLiftName.trim());
-              setNewLiftName("");
-            }}
-            className="bg-purple-600 hover:bg-purple-500 transition rounded px-4 py-2 text-sm font-display text-white"
-          >
-            + Add Exercise
-          </button>
+        <div className="space-y-2 max-h-[32rem] overflow-y-auto pr-1">
+          {sortedWorkouts.map((w) => (
+            <WorkoutCard
+              key={w.id}
+              workout={w}
+              isActive={w.id === activeWorkoutId}
+              onExpand={() => setActiveWorkoutId(w.id)}
+              onAddExercise={(name) => addExercise(w.id, name)}
+              onAddSet={(exerciseId, data) => addSet(w.id, exerciseId, data)}
+              onFinish={() => setActiveWorkoutId(null)}
+            />
+          ))}
+          {sortedWorkouts.length === 0 && (
+            <div className="text-gray-500 text-sm font-mono">No workouts yet. Start one above.</div>
+          )}
         </div>
       </GlowCard>
 
-      {lift && stats && (
-        <>
-          <GlowCard>
-            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-              <h3 className="font-display text-lg text-purple-300">
-                Log Set &mdash; {lift.name}
-              </h3>
-              <button
-                onClick={() => toggleUnit(lift)}
-                className="text-xs font-mono px-2 py-1 rounded border border-white/20 text-gray-300 hover:border-amber-400"
-              >
-                Unit: {lift.unit.toUpperCase()} (toggle)
-              </button>
-            </div>
-            <div className="flex flex-wrap gap-3 items-end">
-              <div>
-                <label className="block text-xs font-mono text-gray-400 mb-1">Date</label>
-                <input
-                  type="date"
-                  value={date}
-                  max={toISODate(new Date())}
-                  onChange={(e) => setDate(e.target.value)}
-                  className="bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-mono text-gray-400 mb-1">Sets</label>
-                <input
-                  type="number"
-                  value={sets}
-                  onChange={(e) => setSets(e.target.value)}
-                  className="bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono w-20"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-mono text-gray-400 mb-1">Reps</label>
-                <input
-                  type="number"
-                  value={reps}
-                  onChange={(e) => setReps(e.target.value)}
-                  className="bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono w-20"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-mono text-gray-400 mb-1">
-                  Weight ({lift.unit})
-                </label>
-                <input
-                  type="number"
-                  step="0.5"
-                  value={weight}
-                  onChange={(e) => setWeight(e.target.value)}
-                  className="bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono w-24"
-                />
-              </div>
-              <button
-                onClick={() => {
-                  const w = parseFloat(weight);
-                  const r = parseInt(reps);
-                  const s = parseInt(sets);
-                  if (!w || !r || !s) return;
-                  addLiftEntry(lift.id, date, s, r, w);
-                  setSets("");
-                  setReps("");
-                  setWeight("");
-                }}
-                className="bg-amber-500 hover:bg-amber-400 transition rounded px-4 py-2 text-sm font-display text-black shadow-[0_0_12px_rgba(245,158,11,0.6)]"
-              >
-                + Log Set
-              </button>
-            </div>
-          </GlowCard>
-
-          <GlowCard>
-            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-              <h3 className="font-display text-lg text-purple-300">Progress</h3>
-              <div className="font-mono text-sm text-amber-400">
-                Est. 1RM: {stats.best1RM.toFixed(1)} kg
-              </div>
-            </div>
-            <div style={{ width: "100%", height: 260 }}>
-              <ResponsiveContainer>
-                <LineChart data={chartData}>
-                  <CartesianGrid stroke="#ffffff15" strokeDasharray="3 3" />
-                  <XAxis dataKey="label" stroke="#9ca3af" fontSize={11} />
-                  <YAxis stroke="#9ca3af" fontSize={11} domain={["auto", "auto"]} />
-                  <Tooltip
-                    contentStyle={{
-                      background: "#13152499",
-                      border: "1px solid #7C3AED55",
-                      fontSize: 12,
-                    }}
-                  />
-                  <Legend wrapperStyle={{ fontSize: 11 }} />
-                  <Line
-                    type="monotone"
-                    dataKey="oneRM"
-                    name="Est. 1RM"
-                    stroke={ACCENT_GOLD}
-                    strokeWidth={2.5}
-                    dot={{ r: 3 }}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="weight"
-                    name="Set weight"
-                    stroke={ACCENT_PURPLE}
-                    strokeWidth={1.5}
-                    dot={{ r: 2 }}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          </GlowCard>
-
-          <GlowCard>
-            <h3 className="font-display text-lg text-purple-300 mb-3">History</h3>
-            <div className="space-y-1 max-h-72 overflow-y-auto pr-1">
-              {[...stats.sorted].reverse().map((e) => (
-                <div
-                  key={e.id}
-                  className="flex justify-between items-center text-sm font-mono text-gray-300 border-b border-white/5 py-1"
-                >
-                  <span>{fmtDate(e.date)}</span>
-                  <span>
-                    {e.sets}x{e.reps} @ {e.weight}
-                    {lift.unit}
-                  </span>
-                  <span className="text-gray-500">
-                    1RM {epley1RM(e.weight, e.reps).toFixed(1)}
-                  </span>
-                  {e.id === stats.bestEntryId && (
-                    <span className="text-amber-400 font-display text-xs px-2 py-0.5 rounded border border-amber-400/60 bg-amber-400/10">
-                      PR
-                    </span>
-                  )}
-                </div>
-              ))}
-              {stats.sorted.length === 0 && (
-                <div className="text-gray-500 text-sm font-mono">No sets logged yet.</div>
-              )}
-            </div>
-          </GlowCard>
-        </>
-      )}
+      <GlowCard>
+        <h3 className="font-display text-lg text-purple-300 mb-4">Exercise Records</h3>
+        <ExerciseRecords workouts={workouts} />
+      </GlowCard>
     </div>
   );
 }
@@ -864,19 +941,15 @@ function LiftTab({ lifts, addLift, addLiftEntry }) {
 /* Character Sheet Tab                                                */
 /* ------------------------------------------------------------------ */
 
-function CharacterSheetTab({ stats, weightEntries }) {
+function CharacterSheetTab({ stats, weightEntries, username }) {
   const trend = useMemo(() => weightTrend(weightEntries), [weightEntries]);
   return (
     <div className="space-y-6">
       <GlowCard>
         <h3 className="font-display text-xl text-amber-400 mb-4 tracking-wider">
-          WARRIOR STATUS
+          {username.toUpperCase()}'S STATUS
         </h3>
-        <XPBar
-          xpIntoLevel={stats.xpIntoLevel}
-          xpForNext={stats.xpForNext}
-          level={stats.level}
-        />
+        <XPBar xpIntoLevel={stats.xpIntoLevel} xpForNext={stats.xpForNext} level={stats.level} />
         <div className="mt-2 font-mono text-xs text-gray-400">
           This week: +{stats.weeklyXP} XP earned
         </div>
@@ -886,16 +959,11 @@ function CharacterSheetTab({ stats, weightEntries }) {
         <h3 className="font-display text-lg text-purple-300 mb-4">Character Stats</h3>
         <StatBar label="STR (avg 1RM)" value={stats.strScore} max={250} color={ACCENT_GOLD} />
         <StatBar label="PWR (total power)" value={stats.pwrScore} max={600} color={ACCENT_PURPLE} />
-        <StatBar
-          label="CONSISTENCY"
-          value={stats.consistencyPct}
-          max={100}
-          color="#22d3ee"
-        />
+        <StatBar label="CONSISTENCY" value={stats.consistencyPct} max={100} color="#22d3ee" />
         <StatBar label="STREAK (days)" value={stats.streak} max={30} color="#f472b6" />
         <div className="grid grid-cols-2 gap-4 mt-4 font-mono text-sm">
           <div className="rounded-lg bg-black/30 border border-white/10 p-3">
-            <div className="text-gray-400 text-xs">Total Entries</div>
+            <div className="text-gray-400 text-xs">Total Sets Logged</div>
             <div className="text-white text-lg">{stats.totalEntries}</div>
           </div>
           <div className="rounded-lg bg-black/30 border border-white/10 p-3">
@@ -914,16 +982,11 @@ function CharacterSheetTab({ stats, weightEntries }) {
       </GlowCard>
 
       <GlowCard>
-        <h3 className="font-display text-lg text-purple-300 mb-3">Per-Lift Power</h3>
+        <h3 className="font-display text-lg text-purple-300 mb-3">Per-Exercise Power</h3>
         <div className="space-y-3">
           {stats.liftStatsList.map((l) => (
-            <div key={l.lift.id}>
-              <StatBar
-                label={l.lift.name}
-                value={l.powerLevel}
-                max={250}
-                color={ACCENT_PURPLE}
-              />
+            <div key={l.name}>
+              <StatBar label={l.name} value={l.powerLevel} max={250} color={ACCENT_PURPLE} />
             </div>
           ))}
           {stats.liftStatsList.length === 0 && (
@@ -968,12 +1031,216 @@ function AchievementsTab({ stats, unlocked }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Avatar Tab                                                          */
+/* ------------------------------------------------------------------ */
+
+function AvatarFigure({ weightKg, pwrScore, level }) {
+  const w = weightKg ?? 84;
+  const wT = Math.max(0, Math.min(1, (w - 60) / 50));
+  const muscleT = Math.max(0, Math.min(1, pwrScore / 600));
+  const levelT = Math.max(0, Math.min(1, (level - 1) / 9));
+
+  const shoulderWidth = 86 + muscleT * 46;
+  const waistWidth = 56 + wT * 30 - muscleT * 6;
+  const armWidth = 13 + muscleT * 11;
+  const legWidth = 24 + wT * 10 + muscleT * 8;
+  const chestBulge = 0.15 + muscleT * 0.55;
+
+  const glowColor = lerpColor(ACCENT_PURPLE, ACCENT_GOLD, levelT);
+  const glowOpacity = 0.18 + levelT * 0.5;
+  const skinFill = lerpColor("#2a2d42", "#3a3550", muscleT);
+  const outlineColor = lerpColor("#9d8cff", ACCENT_GOLD, levelT);
+
+  const halfShoulder = shoulderWidth / 2;
+  const halfWaist = waistWidth / 2;
+  const cx = 150;
+  const shoulderY = 110;
+  const waistY = 255;
+
+  return (
+    <svg viewBox="0 0 300 500" className="w-full max-w-xs mx-auto">
+      <defs>
+        <filter id="avatarGlow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="8" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+
+      {/* glow halo */}
+      <ellipse
+        cx={cx}
+        cy="260"
+        rx={shoulderWidth * 1.1}
+        ry="220"
+        fill={glowColor}
+        opacity={glowOpacity * 0.25}
+      />
+
+      <g filter="url(#avatarGlow)">
+        {/* legs */}
+        <rect
+          x={cx - halfWaist * 0.55 - legWidth / 2}
+          y={waistY}
+          width={legWidth}
+          height="150"
+          rx={legWidth / 2}
+          fill={skinFill}
+          stroke={outlineColor}
+          strokeWidth="2"
+        />
+        <rect
+          x={cx + halfWaist * 0.55 - legWidth / 2}
+          y={waistY}
+          width={legWidth}
+          height="150"
+          rx={legWidth / 2}
+          fill={skinFill}
+          stroke={outlineColor}
+          strokeWidth="2"
+        />
+        {/* quad definition */}
+        <ellipse
+          cx={cx - halfWaist * 0.55}
+          cy={waistY + 45}
+          rx={legWidth / 2 + 2}
+          ry="26"
+          fill={glowColor}
+          opacity={chestBulge * 0.35}
+        />
+        <ellipse
+          cx={cx + halfWaist * 0.55}
+          cy={waistY + 45}
+          rx={legWidth / 2 + 2}
+          ry="26"
+          fill={glowColor}
+          opacity={chestBulge * 0.35}
+        />
+
+        {/* torso */}
+        <polygon
+          points={`${cx - halfShoulder},${shoulderY} ${cx + halfShoulder},${shoulderY} ${cx + halfWaist},${waistY} ${cx - halfWaist},${waistY}`}
+          fill={skinFill}
+          stroke={outlineColor}
+          strokeWidth="2.5"
+        />
+        {/* chest definition */}
+        <ellipse
+          cx={cx}
+          cy={shoulderY + 45}
+          rx={halfShoulder * 0.7}
+          ry="34"
+          fill={glowColor}
+          opacity={chestBulge * 0.4}
+        />
+        {muscleT > 0.45 && (
+          <line
+            x1={cx}
+            y1={shoulderY + 15}
+            x2={cx}
+            y2={waistY - 15}
+            stroke={outlineColor}
+            strokeWidth="1.5"
+            opacity="0.5"
+          />
+        )}
+
+        {/* arms */}
+        <rect
+          x={cx - halfShoulder - armWidth + 4}
+          y={shoulderY + 4}
+          width={armWidth}
+          height="120"
+          rx={armWidth / 2}
+          fill={skinFill}
+          stroke={outlineColor}
+          strokeWidth="2"
+        />
+        <rect
+          x={cx + halfShoulder - 4}
+          y={shoulderY + 4}
+          width={armWidth}
+          height="120"
+          rx={armWidth / 2}
+          fill={skinFill}
+          stroke={outlineColor}
+          strokeWidth="2"
+        />
+        {/* bicep bulges */}
+        <ellipse
+          cx={cx - halfShoulder - armWidth / 2 + 4}
+          cy={shoulderY + 50}
+          rx={armWidth / 2 + 2}
+          ry="18"
+          fill={glowColor}
+          opacity={chestBulge * 0.4}
+        />
+        <ellipse
+          cx={cx + halfShoulder + armWidth / 2 - 4}
+          cy={shoulderY + 50}
+          rx={armWidth / 2 + 2}
+          ry="18"
+          fill={glowColor}
+          opacity={chestBulge * 0.4}
+        />
+
+        {/* neck */}
+        <rect x={cx - 12} y={shoulderY - 22} width="24" height="26" fill={skinFill} stroke={outlineColor} strokeWidth="2" />
+
+        {/* head */}
+        <circle cx={cx} cy={shoulderY - 42} r="32" fill={skinFill} stroke={outlineColor} strokeWidth="2.5" />
+      </g>
+    </svg>
+  );
+}
+
+function AvatarTab({ weightEntries, stats }) {
+  const weightKg = latestWeight(weightEntries);
+  const strengthLabel =
+    stats.level >= 8
+      ? "Legendary"
+      : stats.level >= 5
+      ? "Heroic"
+      : stats.level >= 3
+      ? "Seasoned"
+      : "Novice";
+
+  return (
+    <GlowCard>
+      <h3 className="font-display text-lg text-purple-300 mb-4 text-center">Digital Twin</h3>
+      <AvatarFigure weightKg={weightKg} pwrScore={stats.pwrScore} level={stats.level} />
+      <div className="grid grid-cols-3 gap-3 mt-6 font-mono text-sm text-center">
+        <div className="rounded-lg bg-black/30 border border-white/10 p-3">
+          <div className="text-gray-400 text-xs mb-1">Height</div>
+          <div className="text-white">6'2"</div>
+        </div>
+        <div className="rounded-lg bg-black/30 border border-white/10 p-3">
+          <div className="text-gray-400 text-xs mb-1">Weight</div>
+          <div className="text-white">{weightKg ? `${weightKg.toFixed(1)} kg` : "—"}</div>
+        </div>
+        <div className="rounded-lg bg-black/30 border border-white/10 p-3">
+          <div className="text-gray-400 text-xs mb-1">Strength Level</div>
+          <div className="text-amber-400">{strengthLabel}</div>
+        </div>
+      </div>
+      <div className="text-center font-mono text-xs text-gray-500 mt-4">
+        Your twin evolves as your Power and Warrior Level grow.
+      </div>
+    </GlowCard>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* App                                                                 */
 /* ------------------------------------------------------------------ */
 
 export default function FitnessRPGApp() {
+  const [auth, setAuth] = useState({ loggedIn: false, username: "" });
   const [state, setState] = useState(() => loadState());
   const [tab, setTab] = useState("sheet");
+  const [activeWorkoutId, setActiveWorkoutId] = useState(null);
   const [prEvent, setPrEvent] = useState(null);
   const [levelUp, setLevelUp] = useState(null);
   const prevLevelRef = useRef(null);
@@ -983,8 +1250,8 @@ export default function FitnessRPGApp() {
   }, [state]);
 
   const stats = useMemo(
-    () => computeWarriorStats(state.weightEntries, state.lifts),
-    [state.weightEntries, state.lifts]
+    () => computeWarriorStats(state.weightEntries, state.workouts),
+    [state.weightEntries, state.workouts]
   );
 
   useEffect(() => {
@@ -1000,9 +1267,7 @@ export default function FitnessRPGApp() {
 
   useEffect(() => {
     const unlocked = new Set(state.unlockedAchievements);
-    const newly = ACHIEVEMENT_DEFS.filter(
-      (a) => !unlocked.has(a.id) && a.check(stats)
-    );
+    const newly = ACHIEVEMENT_DEFS.filter((a) => !unlocked.has(a.id) && a.check(stats));
     if (newly.length) {
       setState((s) => ({
         ...s,
@@ -1011,49 +1276,62 @@ export default function FitnessRPGApp() {
     }
   }, [stats]);
 
-  const addWeightEntry = (date, weight) => {
+  const startWorkout = () => {
+    const w = { id: uid(), date: toISODate(new Date()), exercises: [] };
+    setState((s) => ({ ...s, workouts: [...s.workouts, w] }));
+    setActiveWorkoutId(w.id);
+  };
+
+  const addExercise = (workoutId, name) => {
     setState((s) => ({
       ...s,
-      weightEntries: [...s.weightEntries, { id: uid(), date, weight }],
+      workouts: s.workouts.map((w) =>
+        w.id === workoutId
+          ? { ...w, exercises: [...w.exercises, { id: uid(), name, sets: [] }] }
+          : w
+      ),
     }));
   };
 
-  const addLift = (name) => {
-    setState((s) => ({
-      ...s,
-      lifts: [...s.lifts, { id: uid(), name, unit: "kg", entries: [] }],
-    }));
-  };
-
-  const addLiftEntry = (liftId, date, sets, reps, weight, newUnit) => {
+  const addSet = (workoutId, exerciseId, data) => {
     setState((s) => {
-      const lifts = s.lifts.map((l) => {
-        if (l.id !== liftId) return l;
-        if (newUnit) return { ...l, unit: newUnit };
-        const before = computeLiftStats(l).best1RM;
-        const entry = { id: uid(), date, sets, reps, weight };
-        const updated = { ...l, entries: [...l.entries, entry] };
-        const after = computeLiftStats(updated);
-        const newOneRM = epley1RM(weight, reps);
-        if (newOneRM >= before) {
-          setPrEvent({ liftName: l.name, oneRM: newOneRM, key: entry.id });
-        }
-        return updated;
+      const workouts = s.workouts.map((w) => {
+        if (w.id !== workoutId) return w;
+        const exercises = w.exercises.map((ex) => {
+          if (ex.id !== exerciseId) return ex;
+          const isTimeBased = TIME_BASED_EXERCISES.has(ex.name);
+          const priorSorted = flattenExerciseSets(s.workouts, ex.name);
+          const priorBest = computeExerciseStats(ex.name, priorSorted).best;
+          const newMetric = isTimeBased ? data.durationSec : epley1RM(data.weight, data.reps);
+          if (newMetric >= priorBest) {
+            setPrEvent({
+              liftName: ex.name,
+              detail: isTimeBased ? `Hold: ${data.durationSec}s` : `1RM: ${newMetric.toFixed(1)} kg`,
+            });
+          }
+          return { ...ex, sets: [...ex.sets, { id: uid(), ...data }] };
+        });
+        return { ...w, exercises };
       });
-      return { ...s, lifts };
+      return { ...s, workouts };
     });
   };
 
+  if (!auth.loggedIn) {
+    return <LoginScreen onLogin={(username) => setAuth({ loggedIn: true, username })} />;
+  }
+
   const tabs = [
     { id: "sheet", label: "Character Sheet" },
-    { id: "weight", label: "Bodyweight" },
-    { id: "lifts", label: "Lifts" },
+    { id: "workouts", label: "Workouts" },
+    { id: "avatar", label: "Avatar" },
     { id: "achievements", label: "Achievements" },
   ];
 
   return (
     <div
-      className="min-h-screen w-full"
+      key="main-app"
+      className="min-h-screen w-full animate-[fadeInApp_0.7s_ease-out]"
       style={{ background: BG, color: "#e5e7eb" }}
     >
       <style>{`
@@ -1074,6 +1352,10 @@ export default function FitnessRPGApp() {
           0%, 70% { opacity: 1; }
           100% { opacity: 0; }
         }
+        @keyframes fadeInApp {
+          0% { opacity: 0; transform: scale(0.97); }
+          100% { opacity: 1; transform: scale(1); }
+        }
         input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(1); }
       `}</style>
 
@@ -1086,7 +1368,7 @@ export default function FitnessRPGApp() {
             ⚔ IRON QUEST
           </h1>
           <div className="font-mono text-sm text-amber-400">
-            Warrior LV {stats.level} · 🔥 {stats.streak} day streak
+            {auth.username} · LV {stats.level} · 🔥 {stats.streak} day streak
           </div>
         </div>
       </header>
@@ -1109,28 +1391,26 @@ export default function FitnessRPGApp() {
 
       <main className="max-w-4xl mx-auto px-6 py-6">
         {tab === "sheet" && (
-          <CharacterSheetTab stats={stats} weightEntries={state.weightEntries} />
+          <CharacterSheetTab stats={stats} weightEntries={state.weightEntries} username={auth.username} />
         )}
-        {tab === "weight" && (
-          <WeightTab
-            weightEntries={state.weightEntries}
-            addWeightEntry={addWeightEntry}
+        {tab === "workouts" && (
+          <WorkoutsTab
+            workouts={state.workouts}
+            activeWorkoutId={activeWorkoutId}
+            startWorkout={startWorkout}
+            setActiveWorkoutId={setActiveWorkoutId}
+            addExercise={addExercise}
+            addSet={addSet}
           />
         )}
-        {tab === "lifts" && (
-          <LiftTab lifts={state.lifts} addLift={addLift} addLiftEntry={addLiftEntry} />
-        )}
+        {tab === "avatar" && <AvatarTab weightEntries={state.weightEntries} stats={stats} />}
         {tab === "achievements" && (
           <AchievementsTab stats={stats} unlocked={state.unlockedAchievements} />
         )}
       </main>
 
       <PRToast event={prEvent} onDone={() => setPrEvent(null)} />
-      <LevelUpFlash
-        show={!!levelUp}
-        level={levelUp}
-        onDone={() => setLevelUp(null)}
-      />
+      <LevelUpFlash show={!!levelUp} level={levelUp} onDone={() => setLevelUp(null)} />
     </div>
   );
 }
