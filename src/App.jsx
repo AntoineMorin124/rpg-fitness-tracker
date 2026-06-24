@@ -15,15 +15,13 @@ import {
 /* ------------------------------------------------------------------ */
 
 const STORAGE_KEY = "rpg-fitness-tracker-v2";
+const ACCOUNT_KEY = "rpg-fitness-account-v1";
 const ACCENT_PURPLE = "#7C3AED";
 const ACCENT_GOLD = "#F59E0B";
 const BG = "#0D0F1A";
 
 const XP_PER_SET_LOG = 12;
 const XP_PER_LEVEL = 250;
-
-const VALID_USERNAME = "warrior";
-const VALID_PASSWORD = "ironquest";
 
 const EXERCISE_LIST = [
   "Squat",
@@ -150,73 +148,12 @@ function lerpColor(hex1, hex2, t) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Seed data                                                          */
-/* ------------------------------------------------------------------ */
-
-function generateSeedData() {
-  const weightEntries = [];
-  const baseWeight = 84.5;
-  for (let i = 21; i >= 0; i--) {
-    const date = daysAgoISO(i);
-    const roll = Math.random();
-    if (roll < 0.18) continue;
-    const trend = -0.04 * (21 - i);
-    const noise = (Math.random() - 0.5) * 1.1;
-    const w1 = +(baseWeight + trend + noise).toFixed(1);
-    weightEntries.push({ id: uid(), date, weight: w1 });
-    if (roll > 0.85) {
-      const w2 = +(w1 + (Math.random() - 0.5) * 0.6).toFixed(1);
-      weightEntries.push({ id: uid(), date, weight: w2 });
-    }
-  }
-
-  const liftDefs = [
-    { name: "Bench Press", start: 60, growth: 1.1 },
-    { name: "Squat", start: 80, growth: 1.6 },
-    { name: "Deadlift", start: 100, growth: 1.8 },
-  ];
-  const progress = {};
-  liftDefs.forEach((d) => (progress[d.name] = d.start));
-
-  const workouts = [];
-  for (let i = 19; i >= 0; i -= 3) {
-    const date = daysAgoISO(i);
-    if (Math.random() < 0.1) continue;
-    const exercises = liftDefs
-      .filter(() => Math.random() > 0.15)
-      .map((def) => {
-        progress[def.name] = +(
-          progress[def.name] +
-          def.growth +
-          (Math.random() - 0.4) * 1.2
-        ).toFixed(1);
-        const reps = [5, 6, 8, 10][Math.floor(Math.random() * 4)];
-        const setCount = [3, 4][Math.floor(Math.random() * 2)];
-        const sets = Array.from({ length: setCount }, () => ({
-          id: uid(),
-          reps,
-          weight: progress[def.name],
-        }));
-        return { id: uid(), name: def.name, sets };
-      });
-    if (Math.random() > 0.5) {
-      exercises.push({
-        id: uid(),
-        name: "Plank",
-        sets: [{ id: uid(), durationSec: 30 + Math.round(Math.random() * 60) }],
-      });
-    }
-    if (exercises.length) {
-      workouts.push({ id: uid(), date, exercises });
-    }
-  }
-
-  return { weightEntries, workouts };
-}
-
-/* ------------------------------------------------------------------ */
 /* Persistence                                                        */
 /* ------------------------------------------------------------------ */
+
+function emptyState() {
+  return { weightEntries: [], workouts: [], unlockedAchievements: [] };
+}
 
 function loadState() {
   try {
@@ -225,13 +162,30 @@ function loadState() {
   } catch (e) {
     /* ignore corrupt storage */
   }
-  const seed = generateSeedData();
-  return { ...seed, unlockedAchievements: [] };
+  return emptyState();
 }
 
 function saveState(state) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {
+    /* storage full or unavailable */
+  }
+}
+
+function loadAccount() {
+  try {
+    const raw = localStorage.getItem(ACCOUNT_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    /* ignore corrupt storage */
+  }
+  return null;
+}
+
+function saveAccount(account) {
+  try {
+    localStorage.setItem(ACCOUNT_KEY, JSON.stringify(account));
   } catch (e) {
     /* storage full or unavailable */
   }
@@ -495,23 +449,35 @@ function LevelUpFlash({ show, level, onDone }) {
 /* Login Screen                                                       */
 /* ------------------------------------------------------------------ */
 
-function LoginScreen({ onLogin }) {
+function LoginScreen({ account, onLogin, onCreateAccount, onReset }) {
+  const isNewAccount = !account;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState(false);
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
   const [shake, setShake] = useState(false);
 
+  const fail = (message) => {
+    setError(message);
+    setShake(true);
+    setTimeout(() => setShake(false), 500);
+  };
+
   const submit = () => {
-    if (
-      username.trim().toLowerCase() === VALID_USERNAME &&
-      password === VALID_PASSWORD
+    if (isNewAccount) {
+      if (!username.trim()) return fail("⛔ ENTER A WARRIOR NAME");
+      if (password.length < 4) return fail("⛔ PASSWORD TOO SHORT (4+)");
+      if (password !== confirmPassword) return fail("⛔ PASSWORDS DON'T MATCH");
+      setError("");
+      onCreateAccount(username.trim(), password);
+    } else if (
+      username.trim().toLowerCase() === account.username.toLowerCase() &&
+      password === account.password
     ) {
-      setError(false);
-      onLogin(username.trim());
+      setError("");
+      onLogin(account.username);
     } else {
-      setError(true);
-      setShake(true);
-      setTimeout(() => setShake(false), 500);
+      fail("⛔ ACCESS DENIED");
     }
   };
 
@@ -551,10 +517,12 @@ function LoginScreen({ onLogin }) {
           ⚔ IRON QUEST
         </h1>
         <div className="text-center font-mono text-xs text-purple-300 tracking-[0.2em] mb-6">
-          ENTER THE ARENA
+          {isNewAccount ? "CREATE YOUR WARRIOR" : "ENTER THE ARENA"}
         </div>
 
-        <label className="block text-xs font-mono text-gray-400 mb-1">Username</label>
+        <label className="block text-xs font-mono text-gray-400 mb-1">
+          {isNewAccount ? "Choose a warrior name" : "Username"}
+        </label>
         <input
           value={username}
           onChange={(e) => setUsername(e.target.value)}
@@ -563,19 +531,35 @@ function LoginScreen({ onLogin }) {
           className="w-full bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono mb-4 focus:border-amber-400 outline-none"
         />
 
-        <label className="block text-xs font-mono text-gray-400 mb-1">Password</label>
+        <label className="block text-xs font-mono text-gray-400 mb-1">
+          {isNewAccount ? "Choose a password" : "Password"}
+        </label>
         <input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && submit()}
           placeholder="••••••••"
-          className="w-full bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono mb-4 focus:border-amber-400 outline-none"
+          className={`w-full bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono ${isNewAccount ? "mb-4" : "mb-4"} focus:border-amber-400 outline-none`}
         />
+
+        {isNewAccount && (
+          <>
+            <label className="block text-xs font-mono text-gray-400 mb-1">Confirm password</label>
+            <input
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+              placeholder="••••••••"
+              className="w-full bg-black/40 border border-white/20 rounded px-3 py-2 text-sm text-white font-mono mb-4 focus:border-amber-400 outline-none"
+            />
+          </>
+        )}
 
         {error && (
           <div className="text-center font-display text-xs text-rose-400 mb-4 tracking-widest">
-            ⛔ ACCESS DENIED
+            {error}
           </div>
         )}
 
@@ -583,12 +567,17 @@ function LoginScreen({ onLogin }) {
           onClick={submit}
           className="w-full bg-purple-600 hover:bg-purple-500 transition rounded px-4 py-3 text-sm font-display text-white shadow-[0_0_16px_rgba(124,58,237,0.6)]"
         >
-          ENTER
+          {isNewAccount ? "BEGIN QUEST" : "ENTER"}
         </button>
 
-        <div className="text-center font-mono text-[10px] text-gray-500 mt-4">
-          hint: warrior / ironquest
-        </div>
+        {!isNewAccount && (
+          <div className="text-center font-mono text-[10px] text-gray-500 mt-4">
+            Not {account.username}?{" "}
+            <button onClick={onReset} className="underline hover:text-gray-300">
+              Reset and start a new quest
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1237,6 +1226,7 @@ function AvatarTab({ weightEntries, stats }) {
 /* ------------------------------------------------------------------ */
 
 export default function FitnessRPGApp() {
+  const [account, setAccount] = useState(() => loadAccount());
   const [auth, setAuth] = useState({ loggedIn: false, username: "" });
   const [state, setState] = useState(() => loadState());
   const [tab, setTab] = useState("sheet");
@@ -1318,7 +1308,26 @@ export default function FitnessRPGApp() {
   };
 
   if (!auth.loggedIn) {
-    return <LoginScreen onLogin={(username) => setAuth({ loggedIn: true, username })} />;
+    return (
+      <LoginScreen
+        account={account}
+        onLogin={(username) => setAuth({ loggedIn: true, username })}
+        onCreateAccount={(username, password) => {
+          const newAccount = { username, password };
+          saveAccount(newAccount);
+          setAccount(newAccount);
+          setAuth({ loggedIn: true, username });
+        }}
+        onReset={() => {
+          if (!window.confirm("This will erase your account and all logged data. Continue?")) return;
+          localStorage.removeItem(ACCOUNT_KEY);
+          localStorage.removeItem(STORAGE_KEY);
+          setAccount(null);
+          setState(emptyState());
+          setAuth({ loggedIn: false, username: "" });
+        }}
+      />
+    );
   }
 
   const tabs = [
